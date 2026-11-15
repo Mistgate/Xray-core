@@ -13,6 +13,7 @@ import (
 	"math/big"
 	"runtime"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -102,13 +103,15 @@ type GetOutbound interface {
 // TrafficState is used to track uplink and downlink of one connection
 // It is used by XTLS to determine if switch to raw copy mode, It is used by Vision to calculate padding
 type TrafficState struct {
-	UserUUID               []byte
-	NumberOfPacketToFilter int
-	EnableXtls             bool
-	IsTLS12orAbove         bool
-	IsTLS                  bool
-	Cipher                 uint16
-	RemainingServerHello   int32
+	UserUUID []byte
+	// These fields are updated by XtlsFilterTls, which both VisionReader and VisionWriter call
+	// (from different goroutines), and read by both of them, so they must be accessed atomically.
+	NumberOfPacketToFilter atomic.Int32
+	EnableXtls             atomic.Bool
+	IsTLS12orAbove         atomic.Bool
+	IsTLS                  atomic.Bool
+	Cipher                 atomic.Uint32
+	RemainingServerHello   atomic.Int32
 	Inbound                InboundState
 	Outbound               OutboundState
 }
@@ -140,14 +143,8 @@ type OutboundState struct {
 }
 
 func NewTrafficState(userUUID []byte) *TrafficState {
-	return &TrafficState{
-		UserUUID:               userUUID,
-		NumberOfPacketToFilter: 8,
-		EnableXtls:             false,
-		IsTLS12orAbove:         false,
-		IsTLS:                  false,
-		Cipher:                 0,
-		RemainingServerHello:   -1,
+	s := &TrafficState{
+		UserUUID: userUUID,
 		Inbound: InboundState{
 			WithinPaddingBuffers:     true,
 			UplinkReaderDirectCopy:   false,
@@ -169,6 +166,9 @@ func NewTrafficState(userUUID []byte) *TrafficState {
 			UplinkWriterDirectCopy:   false,
 		},
 	}
+	s.NumberOfPacketToFilter.Store(8)
+	s.RemainingServerHello.Store(-1)
+	return s
 }
 
 // VisionReader is used to read xtls vision protocol
@@ -232,7 +232,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		return buffer, err
 	}
 
-	if *withinPaddingBuffers || w.trafficState.NumberOfPacketToFilter > 0 {
+	if *withinPaddingBuffers || w.trafficState.NumberOfPacketToFilter.Load() > 0 {
 		mb2 := make(buf.MultiBuffer, 0, len(buffer))
 		for _, b := range buffer {
 			newbuffer := XtlsUnpadding(b, w.trafficState, w.isUplink, w.ctx)
@@ -252,7 +252,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 			errors.LogDebug(w.ctx, "XtlsRead unknown command ", *currentCommand, buffer.Len())
 		}
 	}
-	if w.trafficState.NumberOfPacketToFilter > 0 {
+	if w.trafficState.NumberOfPacketToFilter.Load() > 0 {
 		XtlsFilterTls(buffer, w.trafficState, w.ctx)
 	}
 
@@ -354,7 +354,7 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		w.directWriteCounter.Add(int64(mb.Len()))
 	}
 
-	if w.trafficState.NumberOfPacketToFilter > 0 {
+	if w.trafficState.NumberOfPacketToFilter.Load() > 0 {
 		XtlsFilterTls(mb, w.trafficState, w.ctx)
 	}
 
@@ -364,16 +364,16 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		} else {
 			isComplete := IsCompleteRecord(mb)
 			mb = ReshapeMultiBuffer(w.ctx, mb)
-			longPadding := w.trafficState.IsTLS
+			longPadding := w.trafficState.IsTLS.Load()
 			for i, b := range mb {
-				if w.trafficState.IsTLS && b.Len() >= 6 && bytes.Equal(TlsApplicationDataStart, b.BytesTo(3)) && isComplete {
-					if w.trafficState.EnableXtls {
+				if w.trafficState.IsTLS.Load() && b.Len() >= 6 && bytes.Equal(TlsApplicationDataStart, b.BytesTo(3)) && isComplete {
+					if w.trafficState.EnableXtls.Load() {
 						*switchToDirectCopy = true
 					}
 					var command byte = CommandPaddingContinue
 					if i == len(mb)-1 {
 						command = CommandPaddingEnd
-						if w.trafficState.EnableXtls {
+						if w.trafficState.EnableXtls.Load() {
 							command = CommandPaddingDirect
 						}
 					}
@@ -381,7 +381,7 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 					*isPadding = false // padding going to end
 					longPadding = false
 					continue
-				} else if !w.trafficState.IsTLS12orAbove && w.trafficState.NumberOfPacketToFilter <= 1 { // For compatibility with earlier vision receiver, we finish padding 1 packet early
+				} else if !w.trafficState.IsTLS12orAbove.Load() && w.trafficState.NumberOfPacketToFilter.Load() <= 1 { // For compatibility with earlier vision receiver, we finish padding 1 packet early
 					*isPadding = false
 					mb[i] = XtlsPadding(b, CommandPaddingEnd, &w.writeOnceUserUUID, longPadding, w.ctx, w.testseed)
 					break
@@ -389,7 +389,7 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 				var command byte = CommandPaddingContinue
 				if i == len(mb)-1 && !*isPadding {
 					command = CommandPaddingEnd
-					if w.trafficState.EnableXtls {
+					if w.trafficState.EnableXtls.Load() {
 						command = CommandPaddingDirect
 					}
 				}
@@ -626,49 +626,50 @@ func XtlsFilterTls(buffer buf.MultiBuffer, trafficState *TrafficState, ctx conte
 		if b == nil {
 			continue
 		}
-		trafficState.NumberOfPacketToFilter--
+		trafficState.NumberOfPacketToFilter.Add(-1)
 		if b.Len() >= 6 {
 			startsBytes := b.BytesTo(6)
 			if bytes.Equal(TlsServerHandShakeStart, startsBytes[:3]) && startsBytes[5] == TlsHandshakeTypeServerHello {
-				trafficState.RemainingServerHello = (int32(startsBytes[3])<<8 | int32(startsBytes[4])) + 5
-				trafficState.IsTLS12orAbove = true
-				trafficState.IsTLS = true
-				if b.Len() >= 79 && trafficState.RemainingServerHello >= 79 {
+				remainingServerHello := (int32(startsBytes[3])<<8 | int32(startsBytes[4])) + 5
+				trafficState.RemainingServerHello.Store(remainingServerHello)
+				trafficState.IsTLS12orAbove.Store(true)
+				trafficState.IsTLS.Store(true)
+				if b.Len() >= 79 && remainingServerHello >= 79 {
 					sessionIdLen := int32(b.Byte(43))
 					cipherSuite := b.BytesRange(43+sessionIdLen+1, 43+sessionIdLen+3)
-					trafficState.Cipher = uint16(cipherSuite[0])<<8 | uint16(cipherSuite[1])
+					trafficState.Cipher.Store(uint32(cipherSuite[0])<<8 | uint32(cipherSuite[1]))
 				} else {
-					errors.LogDebug(ctx, "XtlsFilterTls short server hello, tls 1.2 or older? ", b.Len(), " ", trafficState.RemainingServerHello)
+					errors.LogDebug(ctx, "XtlsFilterTls short server hello, tls 1.2 or older? ", b.Len(), " ", remainingServerHello)
 				}
 			} else if bytes.Equal(TlsClientHandShakeStart, startsBytes[:2]) && startsBytes[5] == TlsHandshakeTypeClientHello {
-				trafficState.IsTLS = true
+				trafficState.IsTLS.Store(true)
 				errors.LogDebug(ctx, "XtlsFilterTls found tls client hello! ", buffer.Len())
 			}
 		}
-		if trafficState.RemainingServerHello > 0 {
-			end := trafficState.RemainingServerHello
+		if end := trafficState.RemainingServerHello.Load(); end > 0 {
 			if end > b.Len() {
 				end = b.Len()
 			}
-			trafficState.RemainingServerHello -= b.Len()
+			remainingServerHello := trafficState.RemainingServerHello.Add(-b.Len())
 			if bytes.Contains(b.BytesTo(end), Tls13SupportedVersions) {
-				v, ok := Tls13CipherSuiteDic[trafficState.Cipher]
+				cipher := uint16(trafficState.Cipher.Load())
+				v, ok := Tls13CipherSuiteDic[cipher]
 				if !ok {
-					v = "Old cipher: " + strconv.FormatUint(uint64(trafficState.Cipher), 16)
+					v = "Old cipher: " + strconv.FormatUint(uint64(cipher), 16)
 				} else if v != "TLS_AES_128_CCM_8_SHA256" {
-					trafficState.EnableXtls = true
+					trafficState.EnableXtls.Store(true)
 				}
 				errors.LogDebug(ctx, "XtlsFilterTls found tls 1.3! ", b.Len(), " ", v)
-				trafficState.NumberOfPacketToFilter = 0
+				trafficState.NumberOfPacketToFilter.Store(0)
 				return
-			} else if trafficState.RemainingServerHello <= 0 {
+			} else if remainingServerHello <= 0 {
 				errors.LogDebug(ctx, "XtlsFilterTls found tls 1.2! ", b.Len())
-				trafficState.NumberOfPacketToFilter = 0
+				trafficState.NumberOfPacketToFilter.Store(0)
 				return
 			}
-			errors.LogDebug(ctx, "XtlsFilterTls inconclusive server hello ", b.Len(), " ", trafficState.RemainingServerHello)
+			errors.LogDebug(ctx, "XtlsFilterTls inconclusive server hello ", b.Len(), " ", remainingServerHello)
 		}
-		if trafficState.NumberOfPacketToFilter <= 0 {
+		if trafficState.NumberOfPacketToFilter.Load() <= 0 {
 			errors.LogDebug(ctx, "XtlsFilterTls stop filtering", buffer.Len())
 		}
 	}

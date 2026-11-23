@@ -1,7 +1,7 @@
-# Xray-core, with the Vision data race fixed
+# Xray-core, with two data races fixed
 
 This is a fork of [XTLS/Xray-core](https://github.com/XTLS/Xray-core): upstream **v26.11.9** (commit `676eaf66f8f0`) plus
-**one commit** that fixes a data race in XTLS Vision. Nothing else differs. For everything about Xray (features, configuration,
+**two commits**, each fixing a data race: one in XTLS Vision, one in the mux XUDP table. Nothing else differs. For everything about Xray (features, configuration,
 documentation, releases) see upstream; this page only describes what the fork changes.
 
 Maintained for [Mistgate](https://github.com/Mistgate/mistgate), which builds from it. It is published so that anyone can use or
@@ -18,7 +18,7 @@ the Go race detector reports it in any test that pushes traffic through Vision. 
 The patch turns the six fields into `atomic.Int32`, `atomic.Bool` and `atomic.Uint32` and routes every access through `Load`,
 `Store` or `Add`. Values and the order of operations are unchanged, so the wire behaviour is the same.
 
-The diff against upstream is three files:
+The diff against upstream for this commit is three files:
 
 - `proxy/proxy.go`: the `TrafficState` fields, `NewTrafficState` (initial values through `Store`: 8 packets to filter,
   `RemainingServerHello` -1) and every use in `VisionReader`, `VisionWriter` and `XtlsFilterTls`.
@@ -28,10 +28,16 @@ The diff against upstream is three files:
 
 Nothing outside `proxy/proxy.go` reads these fields.
 
+The second commit is three lines in `common/mux/server.go`. `handleStatusNew` set `XUDP.Status = Active` without holding
+`XUDPManager`'s lock, while the janitor goroutine in `common/mux/session.go` reads `Status` under that lock once a minute. Every
+other access to `Status` already holds the lock; now this one does too. The janitor only acts on `Expiring`, and the unlocked
+write only went from `Initializing` to `Active`, so behaviour is unchanged; the race detector reported it whenever the janitor
+ran while an XUDP session was open. Upstream has the same code.
+
 ## Reproduce
 
 ```sh
-git diff v26.11.9 --stat          # README.md, proxy/proxy.go, proxy/vision_test.go
+git diff v26.11.9 --stat          # README.md, common/mux/server.go, proxy/proxy.go, proxy/vision_test.go
 go test -race -run TestVisionTrafficStateRace ./proxy/
 ```
 
@@ -51,7 +57,7 @@ way in its `go.mod`; the Go module proxy and checksum database then serve it lik
 
 ## Branch and tag naming
 
-- Branch `mistgate` is the current state: the latest upstream release the fork follows, plus the patch. It is rebased onto each
+- Branch `mistgate` is the current state: the latest upstream release the fork follows, plus the patches. It is rebased onto each
   new upstream release, so its history is rewritten and it must not be pinned by name.
 - Tag `mistgate/v<upstream version>-<n>` (for example `mistgate/v26.11.9-1`) marks one such commit and never moves. The number
   `n` counts rebuilds on the same upstream version (a changed patch). The tag is for people and for finding the commit; a
@@ -60,11 +66,12 @@ way in its `go.mod`; the Go module proxy and checksum database then serve it lik
 
 ## Move to a new upstream version
 
-1. Fetch upstream and check whether the race is fixed there (`TrafficState` in `proxy/proxy.go`: atomic or locked fields). If it
-   is, retire the fork.
-2. Otherwise start a new branch state from the new upstream tag and carry the one commit over: `git rebase --onto <new tag>
+1. Fetch upstream and check whether the races are fixed there (`TrafficState` in `proxy/proxy.go`: atomic or locked fields;
+   `x.Status = Active` in `common/mux/server.go`: under `XUDPManager`'s lock). Drop a commit upstream no longer needs; if it
+   needs neither, retire the fork.
+2. Otherwise start a new branch state from the new upstream tag and carry the commits over: `git rebase --onto <new tag>
    <old tag> mistgate`, or cherry-pick it and redo the hunk by hand if it no longer applies (six fields, `Load`/`Store`/`Add`).
-   Keep it a single commit on top of the tag.
+   Keep one commit per fix on top of the tag.
 3. Update the base version and commit named at the top of this page, run `go build ./... && go vet ./proxy/` and the test above
    with `-race`, and tag the commit `mistgate/v<new version>-1`.
 4. In Mistgate, point `replace` at the new commit and raise the `require` of `github.com/xtls/xray-core` to the same upstream

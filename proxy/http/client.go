@@ -2,14 +2,13 @@ package http
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/base64"
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
-	"text/template"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -170,46 +169,16 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	return nil
 }
 
-// fillRequestHeader will fill out the template of the headers
-func fillRequestHeader(ctx context.Context, header []*Header) ([]*Header, error) {
-	if len(header) == 0 {
-		return header, nil
-	}
-
-	inbound := session.InboundFromContext(ctx)
-	outbounds := session.OutboundsFromContext(ctx)
-	ob := outbounds[len(outbounds)-1]
-
-	var src net.Destination
-	if inbound != nil {
-		src = inbound.Source
-	} else {
-		src = net.TCPDestination(net.AnyIP, 0)
-	}
-
-	data := struct {
-		Source net.Destination
-		Target net.Destination
-	}{
-		Source: src,
-		Target: ob.Target,
-	}
-
-	filled := make([]*Header, len(header))
-	for i, h := range header {
-		tmpl, err := template.New(h.Key).Parse(h.Value)
-		if err != nil {
-			return nil, err
+// fillRequestHeader checks the headers of the request. Upstream fills them as text/template; this build takes them as
+// they are and refuses a template: importing text/template makes the linker keep every exported method of every type in
+// the program (reflect.Method becomes reachable), which was over 20 MB in a binary that links this package.
+func fillRequestHeader(_ context.Context, header []*Header) ([]*Header, error) {
+	for _, h := range header {
+		if strings.Contains(h.Value, "{{") {
+			return nil, errors.New("header ", h.Key, ": templates are not supported in this build")
 		}
-		var buf bytes.Buffer
-
-		if err = tmpl.Execute(&buf, data); err != nil {
-			return nil, err
-		}
-		filled[i] = &Header{Key: h.Key, Value: buf.String()}
 	}
-
-	return filled, nil
+	return header, nil
 }
 
 // setUpHTTPTunnel will create a socket tunnel via HTTP CONNECT method

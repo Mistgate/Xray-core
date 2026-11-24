@@ -1,7 +1,8 @@
-# Xray-core, with two data races fixed
+# Xray-core, with two data races fixed and a build fix for quic-go 0.65
 
 This is a fork of [XTLS/Xray-core](https://github.com/XTLS/Xray-core): upstream **v26.11.9** (commit `676eaf66f8f0`) plus
-**two commits**, each fixing a data race: one in XTLS Vision, one in the mux XUDP table. Nothing else differs. For everything about Xray (features, configuration,
+**three commits**: two each fix a data race (one in XTLS Vision, one in the mux XUDP table), the third makes the code build with
+`github.com/apernet/quic-go` 0.65. Nothing else differs. For everything about Xray (features, configuration,
 documentation, releases) see upstream; this page only describes what the fork changes.
 
 Maintained for [Mistgate](https://github.com/Mistgate/mistgate), which builds from it. It is published so that anyone can use or
@@ -34,10 +35,17 @@ other access to `Status` already holds the lock; now this one does too. The jani
 write only went from `Initializing` to `Active`, so behaviour is unchanged; the race detector reported it whenever the janitor
 ran while an XUDP session was open. Upstream has the same code.
 
+The third commit moves `github.com/apernet/quic-go` from v0.61.1 to v0.65.1-0.20261109005002-2895f039137a (the version Hysteria
+core v2.14.0 asks for; `go.mod`, `go.sum`). quic-go 0.65 changed `http3.HTTPStreamer.HTTPStream()` to return `(*Stream, error)`, so
+`transport/internet/masque/connectip/proxy.go` takes the error and returns it from `Proxy`, and `transport/internet/masque/warp_test.go` fails
+the test on it. No other call in the tree needed a change: `go build ./...` and the tests of `masque`, `hysteria`, `splithttp` and the MASQUE
+scenarios pass on 0.65. A build against quic-go older than 0.65 no longer compiles.
+
 ## Reproduce
 
 ```sh
-git diff v26.11.9 --stat          # README.md, common/mux/server.go, proxy/proxy.go, proxy/vision_test.go
+git diff v26.11.9 --stat          # README.md, common/mux/server.go, go.mod, go.sum, proxy/proxy.go, proxy/vision_test.go,
+                                  # transport/internet/masque/connectip/proxy.go, transport/internet/masque/warp_test.go
 go test -race -run TestVisionTrafficStateRace ./proxy/
 ```
 
@@ -67,8 +75,8 @@ way in its `go.mod`; the Go module proxy and checksum database then serve it lik
 ## Move to a new upstream version
 
 1. Fetch upstream and check whether the races are fixed there (`TrafficState` in `proxy/proxy.go`: atomic or locked fields;
-   `x.Status = Active` in `common/mux/server.go`: under `XUDPManager`'s lock). Drop a commit upstream no longer needs; if it
-   needs neither, retire the fork.
+   `x.Status = Active` in `common/mux/server.go`: under `XUDPManager`'s lock). Drop a commit upstream no longer needs (the quic-go one, once upstream requires quic-go 0.65 and calls `HTTPStream` with two values); if it
+   needs none, retire the fork.
 2. Otherwise start a new branch state from the new upstream tag and carry the commits over: `git rebase --onto <new tag>
    <old tag> mistgate`, or cherry-pick it and redo the hunk by hand if it no longer applies (six fields, `Load`/`Store`/`Add`).
    Keep one commit per fix on top of the tag.
